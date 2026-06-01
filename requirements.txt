@@ -2,4 +2,4 @@ aiogram>=3.4.1
 aiosqlite>=0.20.0
 apscheduler>=3.10.4
 python-dotenv>=1.0.1
-SQLAlchemy==2.0.0
+SQLAlchemy==2.0.36
