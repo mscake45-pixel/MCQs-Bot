@@ -5,8 +5,6 @@ import os
 import aiosqlite
 from datetime import datetime
 from aiogram import Bot, Dispatcher
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from config import BOT_TOKEN, DB_PATH
 from database.db import init_db, write_queue, db_pool
 from middlewares.throttling import ThrottlingMiddleware
@@ -70,43 +68,6 @@ def save_lobbies():
         except Exception as e:
             logger.error(f"Failed to save lobbies backup: {e}")
 
-async def recover_scheduled_jobs(scheduler):
-    """Reload scheduled jobs from database on bot restart (bot is global now)"""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT id, chat_id, test_id, run_date, interval, shuffle FROM scheduled_tests"
-            ) as cursor:
-                jobs = await cursor.fetchall()
-        
-        recovered_count = 0
-        for job_id, chat_id, test_id, run_date, interval, shuffle in jobs:
-            try:
-                run_datetime = datetime.fromisoformat(run_date)
-                if run_datetime > datetime.now():
-                    from handlers.quiz import trigger_scheduled_test
-                    
-                    scheduler.add_job(
-                        trigger_scheduled_test,
-                        'date',
-                        run_date=run_datetime,
-                        args=[chat_id, test_id, interval, bool(shuffle), job_id],
-                        id=f"test_job_{job_id}",
-                        replace_existing=True
-                    )
-                    recovered_count += 1
-                    logger.info(f"Recovered scheduled job {job_id} for test {test_id}")
-                else:
-                    await db.execute("DELETE FROM scheduled_tests WHERE id = ?", (job_id,))
-                    await db.commit()
-                    logger.info(f"Deleted expired schedule {job_id}")
-            except Exception as e:
-                logger.error(f"Failed to recover job {job_id}: {e}")
-        
-        logger.info(f"Recovered {recovered_count} scheduled jobs")
-    except Exception as e:
-        logger.error(f"Failed to recover scheduled jobs: {e}")
-
 async def cleanup_stale_lobbies():
     """Periodic cleanup of stale lobbies (only those in 'waiting' state)"""
     while True:
@@ -141,26 +102,12 @@ async def main():
     # Load lobbies with timestamp-based cleanup
     load_lobbies()
     
-    jobstores = {
-        'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')
-    }
-    scheduler = AsyncIOScheduler(jobstores=jobstores)
-    scheduler.start()
-    
-    # Inject bot instances BEFORE recovering scheduled jobs
+    # Inject bot instances
     test_management.bot = bot
     quiz.bot_instance = bot
     
-    # Recover scheduled jobs from database (no bot argument needed)
-    await recover_scheduled_jobs(scheduler)
-    
     # Start stale lobby cleanup task
     asyncio.create_task(cleanup_stale_lobbies())
-    
-    @dp.update.middleware()
-    async def scheduler_middleware(handler, event, data):
-        data["scheduler"] = scheduler
-        return await handler(event, data)
     
     dp.message.middleware(ThrottlingMiddleware(limit=1.0))
     
@@ -175,7 +122,6 @@ async def main():
         await dp.start_polling(bot)
     finally:
         logger.info("Shutting down...")
-        scheduler.shutdown()
         await write_queue.stop()
         await db_pool.close_all()
         save_lobbies()
