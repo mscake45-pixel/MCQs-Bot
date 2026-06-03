@@ -172,7 +172,8 @@ async def main():
     logger.info("Starting Telegram Bot...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        # Pass scheduler as a keyword argument so it's available in all handlers
+        await dp.start_polling(bot, scheduler=scheduler)
     finally:
         logger.info("Shutting down...")
         scheduler.shutdown()
