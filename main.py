@@ -3,7 +3,7 @@ import logging
 import pickle
 import os
 import aiosqlite
-from datetime import datetime, timezone
+from datetime import datetime
 from aiogram import Bot, Dispatcher
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -13,9 +13,7 @@ from middlewares.throttling import ThrottlingMiddleware
 from handlers import user, admin, test_management, quiz
 from shared.state import active_lobbies
 
-# Enable APScheduler debug logging to see job execution/missed jobs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
@@ -73,7 +71,7 @@ def save_lobbies():
             logger.error(f"Failed to save lobbies backup: {e}")
 
 async def recover_scheduled_jobs(scheduler):
-    """Reload scheduled jobs from database on bot restart"""
+    """Reload scheduled jobs from database on bot restart (bot is global now)"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
@@ -84,21 +82,17 @@ async def recover_scheduled_jobs(scheduler):
         recovered_count = 0
         for job_id, chat_id, test_id, run_date, interval, shuffle in jobs:
             try:
-                # run_date is stored as naive UTC string (we treat as UTC)
                 run_datetime = datetime.fromisoformat(run_date)
-                now_utc = datetime.now(timezone.utc)
-                # Compare as UTC
-                if run_datetime.replace(tzinfo=timezone.utc) > now_utc:
+                if run_datetime > datetime.now():
                     from handlers.quiz import trigger_scheduled_test
                     
                     scheduler.add_job(
                         trigger_scheduled_test,
                         'date',
-                        run_date=run_datetime,   # naive, but scheduler timezone = UTC
+                        run_date=run_datetime,
                         args=[chat_id, test_id, interval, bool(shuffle), job_id],
-                        id=f"sched_{job_id}",
-                        replace_existing=True,
-                        misfire_grace_time=60   # allow 60 seconds delay
+                        id=f"test_job_{job_id}",
+                        replace_existing=True
                     )
                     recovered_count += 1
                     logger.info(f"Recovered scheduled job {job_id} for test {test_id}")
@@ -129,6 +123,7 @@ async def cleanup_stale_lobbies():
             
             for chat_id in stale_chats:
                 logger.info(f"Removing stale lobby for chat {chat_id}")
+                # Cancel timeout task if exists
                 lobby = active_lobbies.get(chat_id)
                 if lobby and "timeout_task" in lobby:
                     lobby["timeout_task"].cancel()
@@ -140,21 +135,26 @@ async def main():
     logger.info("Initializing database...")
     await init_db()
     
+    # Start write queue for database operations
     await write_queue.start()
+    
+    # Load lobbies with timestamp-based cleanup
     load_lobbies()
     
     jobstores = {
         'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')
     }
-    # Force scheduler to use UTC – this is critical
-    scheduler = AsyncIOScheduler(jobstores=jobstores, timezone="UTC")
+    scheduler = AsyncIOScheduler(jobstores=jobstores)
     scheduler.start()
     
-    # Inject bot instance for scheduled jobs
+    # Inject bot instances BEFORE recovering scheduled jobs
     test_management.bot = bot
     quiz.bot_instance = bot
     
+    # Recover scheduled jobs from database (no bot argument needed)
     await recover_scheduled_jobs(scheduler)
+    
+    # Start stale lobby cleanup task
     asyncio.create_task(cleanup_stale_lobbies())
     
     @dp.update.middleware()
@@ -172,6 +172,7 @@ async def main():
     logger.info("Starting Telegram Bot...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        # Pass scheduler as a keyword argument so it's available in all handlers
         await dp.start_polling(bot, scheduler=scheduler)
     finally:
         logger.info("Shutting down...")
