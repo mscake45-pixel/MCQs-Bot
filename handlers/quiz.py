@@ -2,7 +2,7 @@ import asyncio
 import logging
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command, CommandObject
@@ -13,13 +13,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from database import db
 from shared.state import active_lobbies
-import config
-
-# Add timezone support – works on Python 3.9+ natively, else requires backports.zoneinfo
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo
 
 LOBBY_TIMEOUT_SECONDS = 120
 MIN_INTERVAL_SECONDS = 5
@@ -384,7 +377,7 @@ async def show_leaderboard(chat_id: int, bot: Bot):
     if chat_id in active_lobbies:
         del active_lobbies[chat_id]
 
-# ==================== 6. SCHEDULING (FIXED: UTC conversion, misfire grace) ====================
+# ==================== 6. SCHEDULING ====================
 @router.message(Command("schedule_test"))
 async def cmd_schedule_test(message: Message, state: FSMContext):
     tests = await db.get_user_tests(message.from_user.id)
@@ -415,19 +408,10 @@ async def process_schedule_test(callback: CallbackQuery, state: FSMContext):
 @router.message(ScheduleTestStates.setting_datetime)
 async def process_schedule_datetime(message: Message, state: FSMContext):
     try:
-        # Parse user input as local time (using config.TIMEZONE)
-        user_naive = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
-        local_tz = ZoneInfo(config.TIMEZONE)  # e.g. "Asia/Riyadh"
-        local_aware = user_naive.replace(tzinfo=local_tz)
-        # Convert to UTC for storage and scheduling
-        utc_aware = local_aware.astimezone(timezone.utc)
-        # Remove timezone info to store as naive UTC (APScheduler will treat as UTC)
-        utc_naive = utc_aware.replace(tzinfo=None)
-        
-        if utc_aware <= datetime.now(timezone.utc):
+        dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
+        if dt < datetime.now():
             return await message.answer("❌ Please enter a future date and time.")
-        
-        await state.update_data(run_date=utc_naive)  # store naive UTC
+        await state.update_data(run_date=dt)
         settings = await db.get_user_settings(message.from_user.id)
         default_interval = settings.get('default_interval', 30)
         await message.answer(
@@ -462,36 +446,26 @@ async def process_schedule_interval(message: Message, state: FSMContext):
 async def process_schedule_shuffle(message: Message, state: FSMContext, scheduler: AsyncIOScheduler):
     data = await state.get_data()
     shuffle = message.text.lower() in ['yes', 'y', 'true', '1']
-    
-    # Store UTC timestamp as ISO string in DB
     sched_id = await db.create_schedule(
         message.chat.id,
         data['test_id'],
         f"job_{int(time.time())}",
-        data['run_date'].isoformat(),   # store naive UTC ISO string
+        data['run_date'].strftime("%Y-%m-%d %H:%M:%S"),
         data['interval'],
         shuffle
     )
-    
-    # Schedule job with naive UTC datetime – scheduler.timezone = UTC
     scheduler.add_job(
         trigger_scheduled_test,
         'date',
         run_date=data['run_date'],
         args=[message.chat.id, data['test_id'], data['interval'], shuffle, sched_id],
-        id=f"sched_{sched_id}",
-        misfire_grace_time=60   # important to catch small delays
+        id=f"sched_{sched_id}"
     )
-    
-    # Convert back to local time for display to user
-    local_tz = ZoneInfo(config.TIMEZONE)
-    local_run = data['run_date'].replace(tzinfo=timezone.utc).astimezone(local_tz)
-    
     await state.clear()
     await message.answer(
         f"✅ <b>Quiz Scheduled!</b>\n\n"
         f"📚 {data['test_name']}\n"
-        f"📅 {local_run.strftime('%Y-%m-%d %H:%M')}\n"
+        f"📅 {data['run_date'].strftime('%Y-%m-%d %H:%M')}\n"
         f"⏱ {data['interval']}s per question\n"
         f"🔀 Shuffle: {'ON' if shuffle else 'OFF'}\n\n"
         f"Use /schedules to view or /cancel_schedule {sched_id} to cancel",
@@ -504,13 +478,9 @@ async def cmd_schedules(message: Message):
     if not schedules:
         return await message.answer("📅 No scheduled quizzes.\n\nUse /schedule_test to create one.")
     text = "📅 <b>Scheduled Quizzes</b>\n\n"
-    local_tz = ZoneInfo(config.TIMEZONE)
     for s in schedules:
-        # Convert stored UTC string back to local time for display
-        utc_dt = datetime.fromisoformat(s['run_date'])
-        local_dt = utc_dt.replace(tzinfo=timezone.utc).astimezone(local_tz)
         text += f"📚 <b>{s['name']}</b>\n"
-        text += f"🕒 {local_dt.strftime('%Y-%m-%d %H:%M')}\n"
+        text += f"🕒 {s['run_date']}\n"
         text += f"🆔 ID: <code>{s['id']}</code>\n\n"
     text += "Cancel: <code>/cancel_schedule [ID]</code>"
     await message.answer(text, parse_mode="HTML")
@@ -535,7 +505,6 @@ async def trigger_scheduled_test(chat_id: int, test_id: int, interval: int, shuf
     if not bot:
         logging.error("Bot instance not set for scheduled quiz")
         return
-    logging.info(f"🔥 Scheduled quiz FIRED: chat={chat_id}, test={test_id}, schedule={sched_id}")
     try:
         if interval < MIN_INTERVAL_SECONDS or interval > MAX_INTERVAL_SECONDS:
             interval = max(MIN_INTERVAL_SECONDS, min(interval, MAX_INTERVAL_SECONDS))
